@@ -24,9 +24,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin").lstrip("@")
+BOT_TOKEN =  "8200444868:AAEuaZJvofaISp1AxChmiXMOGynEiJ5mlD0"
+ADMIN_ID = 7825563654
+ADMIN_USERNAME = "Bexr7zz"
 PREMIUM_DAYS = 30
 NOTIFY_BEFORE_DAYS = 3
 PAGE_SIZE = 10
