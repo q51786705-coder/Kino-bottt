@@ -30,6 +30,9 @@ ADMIN_USERNAME = "Bexr7zz"
 PREMIUM_DAYS = 30
 NOTIFY_BEFORE_DAYS = 3
 PAGE_SIZE = 10
+MAX_SEASONS = 50
+MAX_PARTS_PER_SEASON = 500
+MAX_CODE_LENGTH = 20
 BOT_USERNAME = ""
 
 API_TIMEOUT = 10
@@ -218,6 +221,8 @@ async def ensure_schema():
         "ALTER TABLE users ADD COLUMN referral_credited INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN referral_reward_amount INTEGER DEFAULT 0",
         "ALTER TABLE admins ADD COLUMN permissions TEXT DEFAULT ''",
+        "ALTER TABLE media ADD COLUMN season INTEGER DEFAULT 1",
+        "ALTER TABLE media ADD COLUMN description TEXT DEFAULT NULL",
     ]
     for sql in migrations:
         try:
@@ -273,8 +278,10 @@ class MediaUpload(StatesGroup):
     code_choice = State()
     manual_code = State()
     is_premium = State()
+    seasons_count = State()
     parts_count = State()
     waiting_for_videos = State()
+    description = State()
 
 class CodeSearch(StatesGroup):
     waiting_for_code = State()
@@ -1531,12 +1538,161 @@ async def on_bot_blocked_or_unblocked(event: types.ChatMemberUpdated):
 
 # ─── MEDIA YETKAZIB BERISH ───────────────────────────────────────────────────
 
+# Ko'p qismli kontentda qism tugmalari shu miqdorda sahifalanadi
+# (masalan 30 qismli serial — bitta sahifada 1 dan 30 gacha tugma).
+EPISODE_PAGE_SIZE = 30
+
+
+async def send_single_video(sendable, user_id: int, row, code: str, show_season: bool = False):
+    """Bitta media qatorini (bitta video) foydalanuvchiga yuboradi."""
+    db = await get_db()
+    media_id = row["id"]
+    file_id = row["file_id"]
+    title = row["title"]
+    part = row["part"]
+    season = row["season"] or 1
+    category = row["category"]
+    description = row["description"] if "description" in row.keys() else None
+
+    async with db.execute(
+        "SELECT views, likes, dislikes FROM media WHERE id=?", (media_id,)
+    ) as cur:
+        stat_row = await cur.fetchone()
+    views = (stat_row["views"] or 0) + 1
+    likes = stat_row["likes"] or 0
+    dislikes = stat_row["dislikes"] or 0
+
+    await db.execute("UPDATE media SET views=? WHERE id=?", (views, media_id))
+    await db.commit()
+
+    user_is_admin = await is_bot_admin(user_id)
+    # Saqlash/boshqa joyga yuborish FAQAT adminlarga ochiq — Premium
+    # a'zolar ham (oddiy foydalanuvchi kabi) videoni saqlay olmaydi,
+    # faqat pastdagi silka orqali ulashishi mumkin.
+    can_save = user_is_admin
+
+    cat_icon = {"kino": "🎬", "serial": "📺", "anime": "⛩"}.get(category, "🎬")
+    silka = f"https://t.me/{BOT_USERNAME}?start={code}" if BOT_USERNAME else None
+    title_safe = md_escape(title)
+    code_safe = md_escape(code)
+
+    part_line = f"📁 Fasl: {season}  |  📌 Qism: {part}" if show_season else f"📌 Qism: {part}"
+    caption = f"{cat_icon} {title_safe}\n"
+    if description:
+        caption += f"📝 {md_escape(description)}\n"
+    caption += (
+        f"{part_line}\n"
+        f"🔑 Kod: {code_safe}\n"
+        f"👁 Ko'rildi: {views:,} marta"
+    )
+    if not can_save:
+        caption += (
+            "\n\n🔒 _Ushbu videoni saqlash yoki boshqa joyga yuborish "
+            "mumkin emas._\n"
+            "📤 _Do'stlaringizga ulashish uchun quyidagi silkani yuboring:_"
+        )
+    if silka:
+        caption += f"\n🔗 {md_escape(silka)}"
+
+    rating_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text=f"👍 {likes}", callback_data=f"vote_{media_id}_1"
+        ),
+        InlineKeyboardButton(
+            text=f"👎 {dislikes}", callback_data=f"vote_{media_id}_0"
+        ),
+    ]])
+    try:
+        await sendable.answer_video(
+            video=file_id,
+            caption=caption,
+            parse_mode="Markdown",
+            protect_content=not can_save,
+            reply_markup=rating_kb
+        )
+    except Exception as e:
+        logging.error(f"Video yuborishda xato (media_id={media_id}, file_id={file_id}): {e}")
+        if user_is_admin:
+            # Diagnostika xabari ATAYIN parse_mode'siz (oddiy matn)
+            # yuboriladi — chunki xato matnining o'zida ham Markdown'ga
+            # xalaqit beradigan belgilar bo'lishi mumkin.
+            await sendable.answer(
+                f"❌ '{title}' ({part}-qism) videoni yuborib bo'lmadi.\n\n"
+                f"🛠 Xato tafsiloti (faqat admin ko'radi):\n{e}\n\n"
+                f"🆔 media_id: {media_id}"
+            )
+        else:
+            await sendable.answer(f"❌ '{title}' videoni yuborib bo'lmadi.")
+
+
+def build_season_picker_kb(code: str, seasons: list) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text=f"📁 {s}-fasl", callback_data=f"season_{code}_{s}")]
+        for s in seasons
+    ]
+    buttons.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="close_list")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def build_episode_picker_kb(code: str, season: int, parts: list, page: int = 0) -> InlineKeyboardMarkup:
+    start = page * EPISODE_PAGE_SIZE
+    page_items = parts[start:start + EPISODE_PAGE_SIZE]
+    buttons = []
+    row = []
+    for p in page_items:
+        row.append(InlineKeyboardButton(text=str(p), callback_data=f"part_{code}_{season}_{p}"))
+        if len(row) == 5:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            text="⬅️ Oldingi", callback_data=f"eppage_{code}_{season}_{page - 1}"
+        ))
+    if start + EPISODE_PAGE_SIZE < len(parts):
+        nav.append(InlineKeyboardButton(
+            text="Keyingi ➡️", callback_data=f"eppage_{code}_{season}_{page + 1}"
+        ))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="close_list")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def send_episode_picker(sendable, code: str, season: int, rows: list, page: int = 0, title: str = None, description: str = None):
+    parts = [r["part"] for r in rows]
+    kb = build_episode_picker_kb(code, season, parts, page)
+    total_pages = max(1, (len(parts) + EPISODE_PAGE_SIZE - 1) // EPISODE_PAGE_SIZE)
+
+    header_lines = []
+    if title:
+        header_lines.append(f"🎬 *{md_escape(title)}*")
+    if description:
+        header_lines.append(f"📝 {md_escape(description)}")
+    header_lines.append("")
+    header_lines.append("🎞 *Qismni tanlang:*")
+    header = "\n".join(header_lines)
+    if total_pages > 1:
+        header += f"\n📄 Sahifa {page + 1}/{total_pages}"
+    await sendable.answer(header, parse_mode="Markdown", reply_markup=kb)
+
+
 async def deliver_media_by_code(sendable, user_id: int, code: str):
+    """Kod bo'yicha kontentni ko'rsatadi.
+
+    Agar kodga faqat bitta video biriktirilgan bo'lsa, to'g'ridan-to'g'ri
+    yuboradi. Agar bir nechta qism va/yoki fasl bo'lsa, foydalanuvchiga
+    avval fasl (agar bir nechta bo'lsa), keyin qism tanlash tugmalarini
+    chiqaradi — shu orqali faqat tanlangan video yuboriladi.
+    """
     try:
         db = await get_db()
         async with db.execute(
-            "SELECT id, file_id, title, part, is_premium, category, views, likes, dislikes "
-            "FROM media WHERE code=? ORDER BY part ASC",
+            "SELECT id, file_id, title, part, season, is_premium, category, description "
+            "FROM media WHERE code=? ORDER BY season ASC, part ASC",
             (code,)
         ) as cur:
             results = await cur.fetchall()
@@ -1560,85 +1716,32 @@ async def deliver_media_by_code(sendable, user_id: int, code: str):
             )
             return
 
-        user_is_admin = await is_bot_admin(user_id)
-        # Saqlash/boshqa joyga yuborish FAQAT adminlarga ochiq — Premium
-        # a'zolar ham (oddiy foydalanuvchi kabi) videoni saqlay olmaydi,
-        # faqat pastdagi silka orqali ulashishi mumkin.
-        can_save = user_is_admin
+        if len(results) == 1:
+            await send_single_video(sendable, user_id, results[0], code, show_season=False)
+            return
 
+        seasons_map = {}
         for row in results:
-            media_id = row["id"]
-            file_id = row["file_id"]
-            title = row["title"]
-            part = row["part"]
-            category = row["category"]
-            views = (row["views"] or 0) + 1
-            likes = row["likes"] or 0
-            dislikes = row["dislikes"] or 0
+            seasons_map.setdefault(row["season"] or 1, []).append(row)
 
-            await db.execute("UPDATE media SET views=? WHERE id=?", (views, media_id))
-            await db.commit()
-
-            cat_icon = {"kino": "🎬", "serial": "📺", "anime": "⛩"}.get(category, "🎬")
-            silka = f"https://t.me/{BOT_USERNAME}?start={code}" if BOT_USERNAME else None
-            title_safe = md_escape(title)
-            code_safe = md_escape(code)
-
-            caption = (
-                f"{cat_icon} {title_safe}\n"
-                f"📌 Qism: {part}\n"
-                f"🔑 Kod: {code_safe}\n"
-                f"👁 Ko'rildi: {views:,} marta"
+        if len(seasons_map) > 1:
+            seasons = sorted(seasons_map.keys())
+            title_safe = md_escape(results[0]["title"])
+            desc = results[0]["description"]
+            desc_line = f"📝 {md_escape(desc)}\n\n" if desc else ""
+            await sendable.answer(
+                f"🎬 *{title_safe}*\n\n{desc_line}Faslni tanlang:",
+                parse_mode="Markdown",
+                reply_markup=build_season_picker_kb(code, seasons)
             )
-            if not can_save:
-                caption += (
-                    "\n\n🔒 _Ushbu videoni saqlash yoki boshqa joyga yuborish "
-                    "mumkin emas._\n"
-                    "📤 _Do'stlaringizga ulashish uchun quyidagi silkani yuboring:_"
-                )
-            if silka:
-                caption += f"\n🔗 {md_escape(silka)}"
-
-            rating_kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(
-                    text=f"👍 {likes}", callback_data=f"vote_{media_id}_1"
-                ),
-                InlineKeyboardButton(
-                    text=f"👎 {dislikes}", callback_data=f"vote_{media_id}_0"
-                ),
-            ]])
-            try:
-                await sendable.answer_video(
-                    video=file_id,
-                    caption=caption,
-                    parse_mode="Markdown",
-                    protect_content=not can_save,
-                    reply_markup=rating_kb
-                )
-            except Exception as e:
-                logging.error(f"Video yuborishda xato (media_id={media_id}, file_id={file_id}): {e}")
-                if user_is_admin:
-                    # Diagnostika xabari ATAYIN parse_mode'siz (oddiy matn)
-                    # yuboriladi — chunki xato matnining o'zida ham Markdown'ga
-                    # xalaqit beradigan belgilar bo'lishi mumkin.
-                    await sendable.answer(
-                        f"❌ '{title}' ({part}-qism) videoni yuborib bo'lmadi.\n\n"
-                        f"🛠 Xato tafsiloti (faqat admin ko'radi):\n{e}\n\n"
-                        f"🆔 media_id: {media_id}"
-                    )
-                else:
-                    await sendable.answer(f"❌ '{title}' videoni yuborib bo'lmadi.")
-
-            # Telegram tezlik cheklovi (flood control)ga urilmaslik uchun —
-            # bir nechta qismni ketma-ket yuborganda kichik tanaffus.
-            await asyncio.sleep(0.4)
+        else:
+            only_season = next(iter(seasons_map))
+            await send_episode_picker(
+                sendable, code, only_season, seasons_map[only_season],
+                title=results[0]["title"], description=results[0]["description"]
+            )
 
     except Exception as e:
-        # Yuqoridagi ichki try/except faqat video yuborish xatolarini
-        # ushlaydi. Agar funksiyaning boshqa qismida (masalan baza bilan
-        # ishlashda) kutilmagan xato chiqsa, foydalanuvchi hech qanday
-        # javob olmay "hech narsa bo'lmagandek" qolib ketmasligi uchun bu
-        # tashqi himoya qo'shildi.
         # "query is too old" — muddati o'tgan callback query, jimgina o'tkazib yubor
         if isinstance(e, TelegramBadRequest) and "query is too old" in str(e):
             logging.warning(f"Muddati o'tgan callback query (code={code}, user={user_id})")
@@ -1651,6 +1754,125 @@ async def deliver_media_by_code(sendable, user_id: int, code: str):
                 await sendable.answer("❌ Xatolik yuz berdi. Birozdan so'ng qaytadan urinib ko'ring.")
         except Exception:
             pass
+
+
+@dp.callback_query(F.data.startswith("season_"))
+async def season_pick_cb(call: types.CallbackQuery):
+    payload = call.data[len("season_"):]
+    code, season_str = payload.rsplit("_", 1)
+    season = int(season_str)
+    user_id = call.from_user.id
+
+    # Fasl/qism tanlash tugmalari getmedia_cb'dan keyin bir necha daqiqa
+    # ekranda turishi mumkin. Shu oraliqda admin yangi majburiy kanal
+    # qo'shgan bo'lishi ehtimoli bor — shuning uchun kontentga chiqishdan
+    # oldin obunani yana bir bor tekshiramiz.
+    if not await is_premium_user(user_id):
+        unsub = await check_subscriptions(user_id)
+        if unsub:
+            kb = await build_subscription_keyboard(unsub)
+            await call.message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=kb)
+            await call.answer()
+            return
+
+    db = await get_db()
+    async with db.execute(
+        "SELECT id, file_id, title, part, season, is_premium, category, description "
+        "FROM media WHERE code=? AND season=? ORDER BY part ASC",
+        (code, season)
+    ) as cur:
+        rows = await cur.fetchall()
+    if not rows:
+        await call.answer("❌ Topilmadi.", show_alert=True)
+        return
+    if rows[0]["is_premium"] and not await is_premium_user(user_id):
+        await call.answer("🔒 Bu premium kontent.", show_alert=True)
+        return
+    await send_episode_picker(
+        call.message, code, season, rows,
+        title=rows[0]["title"], description=rows[0]["description"]
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("eppage_"))
+async def episode_page_cb(call: types.CallbackQuery):
+    payload = call.data[len("eppage_"):]
+    code, season_str, page_str = payload.rsplit("_", 2)
+    season = int(season_str)
+    page = int(page_str)
+    db = await get_db()
+    async with db.execute(
+        "SELECT part FROM media WHERE code=? AND season=? ORDER BY part ASC",
+        (code, season)
+    ) as cur:
+        rows = await cur.fetchall()
+    if not rows:
+        await call.answer("❌ Topilmadi.", show_alert=True)
+        return
+    kb = build_episode_picker_kb(code, season, [r["part"] for r in rows], page)
+    try:
+        await call.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("part_"))
+async def part_pick_cb(call: types.CallbackQuery):
+    payload = call.data[len("part_"):]
+    code, season_str, part_str = payload.rsplit("_", 2)
+    season = int(season_str)
+    part = int(part_str)
+    user_id = call.from_user.id
+
+    # Bu — video haqiqatan ham yuboriladigan yagona nuqta, shuning uchun
+    # majburiy obunani shu yerda ham tekshiramiz: agar admin qism/fasl
+    # tugmalari ko'rsatilgandan keyin yangi majburiy kanal qo'shgan bo'lsa,
+    # foydalanuvchi avval o'sha kanalga obuna bo'lishi kerak bo'ladi.
+    if not await is_premium_user(user_id):
+        unsub = await check_subscriptions(user_id)
+        if unsub:
+            kb = await build_subscription_keyboard(unsub)
+            await call.message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=kb)
+            await call.answer()
+            return
+
+    db = await get_db()
+
+    async with db.execute(
+        "SELECT id, file_id, title, part, season, is_premium, category, description "
+        "FROM media WHERE code=? AND season=? AND part=? LIMIT 1",
+        (code, season, part)
+    ) as cur:
+        row = await cur.fetchone()
+    if not row:
+        await call.answer("❌ Video topilmadi.", show_alert=True)
+        return
+
+    if row["is_premium"] and not await is_premium_user(user_id):
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🌟 Premium olish", callback_data="req_premium")],
+            [InlineKeyboardButton(
+                text="👨‍💻 Admin bilan bog'lanish",
+                url=f"https://t.me/{ADMIN_USERNAME}"
+            )]
+        ])
+        await call.message.answer(
+            "🔒 Bu *Premium* kontent!\n\nTomosha qilish uchun premium a'zo bo'ling.",
+            reply_markup=kb, parse_mode="Markdown"
+        )
+        await call.answer()
+        return
+
+    async with db.execute(
+        "SELECT COUNT(DISTINCT season) AS c FROM media WHERE code=?", (code,)
+    ) as cur:
+        season_count_row = await cur.fetchone()
+    show_season = (season_count_row["c"] or 1) > 1
+
+    await send_single_video(call.message, user_id, row, code, show_season=show_season)
+    await call.answer()
 
 
 # ─── RO'YXATLAR ──────────────────────────────────────────────────────────────
@@ -2516,11 +2738,21 @@ async def process_code_choice(message: types.Message, state: FSMContext):
             "Kod kiriting (raqam):", reply_markup=types.ReplyKeyboardRemove()
         )
 
+CODE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,%d}$" % MAX_CODE_LENGTH)
+
 @dp.message(MediaUpload.manual_code)
 async def process_manual_code(message: types.Message, state: FSMContext):
     code = message.text.strip()
     if not code:
         await message.answer("❌ Kod bo'sh bo'lishi mumkin emas. Boshqa kod kiriting:")
+        return
+
+    if not CODE_PATTERN.fullmatch(code):
+        await message.answer(
+            f"❌ Kod faqat lotin harflari, raqam, \"-\" va \"_\" belgilaridan iborat "
+            f"bo'lishi hamda {MAX_CODE_LENGTH} belgidan oshmasligi kerak (bo'sh joysiz).\n"
+            "Boshqa kod kiriting:"
+        )
         return
 
     if await media_code_exists(code):
@@ -2547,11 +2779,35 @@ async def process_manual_code(message: types.Message, state: FSMContext):
 async def process_is_premium(message: types.Message, state: FSMContext):
     is_prem = 1 if "Premium" in message.text else 0
     await state.update_data(is_premium=is_prem)
-    await state.set_state(MediaUpload.parts_count)
+    await state.set_state(MediaUpload.seasons_count)
     await message.answer(
-        "Necha qismdan iborat? (masalan: 1, 5, 12):",
+        "Necha fasldan iborat? (Oddiy kino yoki 1 faslli serial/anime bo'lsa "
+        "— 1 deb yozing):",
         reply_markup=types.ReplyKeyboardRemove()
     )
+
+@dp.message(MediaUpload.seasons_count)
+async def process_seasons_count(message: types.Message, state: FSMContext):
+    try:
+        seasons = int(message.text.strip())
+        if seasons < 1:
+            raise ValueError
+    except ValueError:
+        await message.answer("Iltimos, faqat musbat raqam kiriting!")
+        return
+
+    if seasons > MAX_SEASONS:
+        await message.answer(
+            f"❌ Fasllar soni {MAX_SEASONS} tadan oshmasligi kerak. Qaytadan kiriting:"
+        )
+        return
+
+    await state.update_data(seasons_count=seasons, current_season=1)
+    await state.set_state(MediaUpload.parts_count)
+    if seasons > 1:
+        await message.answer("1-fasl nechta qismdan iborat? (masalan: 1, 5, 12):")
+    else:
+        await message.answer("Necha qismdan iborat? (masalan: 1, 5, 12):")
 
 @dp.message(MediaUpload.parts_count)
 async def process_parts_count(message: types.Message, state: FSMContext):
@@ -2559,23 +2815,43 @@ async def process_parts_count(message: types.Message, state: FSMContext):
         count = int(message.text.strip())
         if count < 1:
             raise ValueError
-        await state.update_data(parts_count=count, current_part=1)
-        await state.set_state(MediaUpload.waiting_for_videos)
-        await message.answer("1-qism videoni yuboring:")
     except ValueError:
         await message.answer("Iltimos, faqat musbat raqam kiriting!")
+        return
+
+    if count > MAX_PARTS_PER_SEASON:
+        await message.answer(
+            f"❌ Bitta fasl/kontent uchun qismlar soni {MAX_PARTS_PER_SEASON} tadan "
+            "oshmasligi kerak. Qaytadan kiriting:"
+        )
+        return
+
+    data = await state.get_data()
+    current_season = data.get("current_season", 1)
+    seasons_count = data.get("seasons_count", 1)
+    await state.update_data(parts_count=count, current_part=1)
+    await state.set_state(MediaUpload.waiting_for_videos)
+    if seasons_count > 1:
+        await message.answer(f"📁 {current_season}-fasl, 1-qism videoni yuboring:")
+    else:
+        await message.answer("1-qism videoni yuboring:")
 
 @dp.message(MediaUpload.waiting_for_videos, F.video)
 async def process_video_upload(message: types.Message, state: FSMContext):
     data = await state.get_data()
     current_part = data["current_part"]
     total_parts = data["parts_count"]
+    current_season = data.get("current_season", 1)
+    seasons_count = data.get("seasons_count", 1)
     db = await get_db()
 
     # Kod tanlangandan keyin boshqa admin shu kod bilan media qo'shgan
-    # bo'lishi mumkin. Saqlashdan oldingi tekshiruv dublikatni yakuniy
-    # bosqichda ham bloklaydi.
-    if await media_code_exists(data["code"]):
+    # bo'lishi mumkin. Bu tekshiruv FAQAT eng birinchi videoda (1-fasl,
+    # 1-qism) kerak — undan keyingi har bir qism/fasl uchun kod DB'da
+    # albatta mavjud bo'ladi (aynan shu yuklash sessiyasi uni saqlagani
+    # uchun), shuning uchun har safar tekshirish soxta "kod band"
+    # xatosini berib, jarayonni buzardi.
+    if current_season == 1 and current_part == 1 and await media_code_exists(data["code"]):
         await state.clear()
         await message.answer(
             "❌ Bu kod avval kiritilgan, video saqlanmadi.\n"
@@ -2585,33 +2861,134 @@ async def process_video_upload(message: types.Message, state: FSMContext):
         return
 
     await db.execute(
-        "INSERT INTO media (code, title, category, file_id, part, is_premium) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO media (code, title, category, file_id, part, season, is_premium) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (data["code"], data["title"], data["category"],
-         message.video.file_id, current_part, data["is_premium"])
+         message.video.file_id, current_part, current_season, data["is_premium"])
     )
     await db.commit()
 
     if current_part < total_parts:
         await state.update_data(current_part=current_part + 1)
+        if seasons_count > 1:
+            await message.answer(
+                f"✅ {current_season}-fasl {current_part}-qism saqlandi. "
+                f"{current_part + 1}-qism videoni yuboring:"
+            )
+        else:
+            await message.answer(
+                f"✅ {current_part}-qism saqlandi. {current_part + 1}-qism videoni yuboring:"
+            )
+        return
+
+    if current_season < seasons_count:
+        next_season = current_season + 1
+        await state.update_data(current_season=next_season, current_part=0)
+        await state.set_state(MediaUpload.parts_count)
         await message.answer(
-            f"✅ {current_part}-qism saqlandi. {current_part + 1}-qism videoni yuboring:"
+            f"✅ {current_season}-fasl to'liq saqlandi ({total_parts} qism).\n\n"
+            f"{next_season}-fasl nechta qismdan iborat?"
         )
+        return
+
+    # Barcha video(lar) saqlandi — endi ixtiyoriy izoh so'raladi.
+    await state.set_state(MediaUpload.description)
+    skip_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⏭ O'tkazib yuborish", callback_data="skip_description")
+    ]])
+    await message.answer(
+        "📝 Kontent uchun izoh (tavsif) qo'shmoqchimisiz? (ixtiyoriy)\n\n"
+        "Izoh matnini yuboring yoki pastdagi tugmani bosing:",
+        reply_markup=skip_kb
+    )
+
+@dp.message(MediaUpload.waiting_for_videos)
+async def process_video_upload_invalid(message: types.Message, state: FSMContext):
+    """Video kutilayotgan bosqichda video bo'lmagan xabar kelsa (rasm, matn,
+    fayl va h.k.) — bot indamay o'tirib qolmasligi uchun aniq ogohlantiradi."""
+    data = await state.get_data()
+    seasons_count = data.get("seasons_count", 1)
+    current_season = data.get("current_season", 1)
+    current_part = data.get("current_part", 1)
+    if seasons_count > 1:
+        hint = f"📁 {current_season}-fasl, {current_part}-qism videoni yuboring."
     else:
-        cat_icon = {"kino": "🎬", "serial": "📺", "anime": "⛩"}.get(
-            data["category"], "🎬"
+        hint = f"{current_part}-qism videoni yuboring."
+    await message.answer(f"❌ Iltimos, video yuboring.\n{hint}")
+
+
+MAX_DESCRIPTION_LENGTH = 500
+
+
+async def finalize_media_upload(answer_func, user_id: int, state: FSMContext, description: str = None):
+    """Yuklash jarayonini yakunlaydi: agar izoh berilgan bo'lsa uni shu kodga
+    tegishli barcha qatorlarga yozadi, so'ng yakuniy xabarni chiqaradi va
+    holatni tozalaydi."""
+    data = await state.get_data()
+    code = data["code"]
+
+    if description:
+        db = await get_db()
+        await db.execute(
+            "UPDATE media SET description=? WHERE code=?", (description, code)
         )
-        status_str = "🌟 Premium" if data["is_premium"] else "🌐 Oddiy"
-        title_safe = md_escape(data['title'])
-        code_safe = md_escape(data['code'])
+        await db.commit()
+
+    cat_icon = {"kino": "🎬", "serial": "📺", "anime": "⛩"}.get(
+        data["category"], "🎬"
+    )
+    status_str = "🌟 Premium" if data["is_premium"] else "🌐 Oddiy"
+    title_safe = md_escape(data['title'])
+    code_safe = md_escape(code)
+    seasons_count = data.get("seasons_count", 1)
+    season_line = f"📁 Fasllar: *{seasons_count}*\n" if seasons_count > 1 else ""
+    desc_line = f"📝 Izoh: {md_escape(description)}\n" if description else ""
+
+    await answer_func(
+        f"🎉 Barcha qismlar saqlandi!\n\n"
+        f"{cat_icon} *{title_safe}*\n"
+        f"{season_line}"
+        f"{desc_line}"
+        f"🔑 Kod: `{code_safe}`\n"
+        f"📌 Turi: {status_str}",
+        reply_markup=admin_menu(user_id), parse_mode="Markdown"
+    )
+    await state.clear()
+
+
+@dp.message(MediaUpload.description, F.text)
+async def process_description_text(message: types.Message, state: FSMContext):
+    description = message.text.strip()
+    if not description:
         await message.answer(
-            f"🎉 Barcha *{total_parts}* ta qism saqlandi!\n\n"
-            f"{cat_icon} *{title_safe}*\n"
-            f"🔑 Kod: `{code_safe}`\n"
-            f"📌 Turi: {status_str}",
-            reply_markup=admin_menu(message.from_user.id), parse_mode="Markdown"
+            "❌ Iltimos, izoh matnini yuboring yoki \"⏭ O'tkazib yuborish\" "
+            "tugmasini bosing."
         )
-        await state.clear()
+        return
+    if len(description) > MAX_DESCRIPTION_LENGTH:
+        await message.answer(
+            f"❌ Izoh juda uzun (eng ko'pi {MAX_DESCRIPTION_LENGTH} belgi). "
+            "Qisqaroq yozing:"
+        )
+        return
+    await finalize_media_upload(message.answer, message.from_user.id, state, description=description)
+
+@dp.message(MediaUpload.description)
+async def process_description_invalid(message: types.Message):
+    """Izoh bosqichida matn bo'lmagan narsa (rasm, video va h.k.) kelsa."""
+    await message.answer(
+        "❌ Iltimos, izoh uchun oddiy matn yuboring yoki "
+        "\"⏭ O'tkazib yuborish\" tugmasini bosing."
+    )
+
+@dp.callback_query(F.data == "skip_description", MediaUpload.description)
+async def skip_description_cb(call: types.CallbackQuery, state: FSMContext):
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await finalize_media_upload(call.message.answer, call.from_user.id, state, description=None)
+    await call.answer()
 
 
 # ─── MEDIA O'CHIRISH ──────────────────────────────────────────────────────────
